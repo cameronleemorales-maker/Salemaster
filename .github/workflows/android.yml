@@ -14,16 +14,13 @@ jobs:
       UNZIP_DIR: project
       ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
       ANDROID_HOME: ${{ github.workspace }}/android-sdk
-      # Pick platform/build-tools you actually target; these are safe defaults:
       ANDROID_PLATFORM: "platforms;android-34"
       ANDROID_BUILD_TOOLS: "build-tools;34.0.0"
 
     steps:
-      # 1) Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Verify ZIP exists (exact name, case-sensitive)
       - name: Verify ZIP exists
         shell: bash
         run: |
@@ -33,7 +30,6 @@ jobs:
             exit 1
           fi
 
-      # 3) Unzip to ./project
       - name: Unzip project
         shell: bash
         run: |
@@ -43,7 +39,6 @@ jobs:
           echo "Contents of $UNZIP_DIR:"
           ls -la "$UNZIP_DIR"
 
-      # 4) Detect Gradle project root (no 'find' to avoid Unicode dash issues)
       - name: Detect Gradle project root
         id: gradleroot
         shell: bash
@@ -69,7 +64,6 @@ jobs:
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
           echo "Gradle root is: $ROOT"
 
-      # 5) Set up JDK 17
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -77,7 +71,7 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      # 6) Install Android cmdline-tools + SDK bits (non-interactive)
+      # ---------- FIXED STEP: sdkmanager was not on PATH in same step ----------
       - name: Install Android SDK (cmdline-tools)
         shell: bash
         run: |
@@ -86,31 +80,41 @@ jobs:
           mkdir -p "$SDK"/cmdline-tools
           cd "$SDK"
 
-          # Download latest commandline tools
+          # Download and unpack latest commandline-tools
           curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdline-tools.zip -d cmdline-tools
           mv cmdline-tools/cmdline-tools cmdline-tools/latest
           rm -f cmdline-tools.zip
 
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/build-tools/34.0.0" >> $GITHUB_PATH
+          # Make sdkmanager available **in this step**
+          export ANDROID_SDK_ROOT="$SDK"
+          export ANDROID_HOME="$SDK"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/34.0.0:$PATH"
 
-          sdkmanager --version
+          echo "sdkmanager path = $(command -v sdkmanager || echo 'NOT FOUND')"
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            echo "sdkmanager not found after install."
+            ls -la "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" || true
+            exit 127
+          fi
 
-          # Accept licenses (ignore broken pipe warnings if any)
+          # Accept licenses (ignore broken pipe noise)
           yes | sdkmanager --licenses || true
 
-          # Install required packages
+          # Required packages
           yes | sdkmanager "platform-tools" "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}"
 
-      # 7) Set up Gradle (cache & tools)
+          # Also export to later steps
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/build-tools/34.0.0" >> "$GITHUB_PATH"
+      # ------------------------------------------------------------------------
+
       - name: Set up Gradle (cache & tools)
         uses: gradle/actions/setup-gradle@v3
 
-      # 8) Fix gradlew + wrapper permissions when present inside the zip
       - name: Fix Gradle wrapper permissions (if present)
         shell: bash
         run: |
@@ -123,7 +127,6 @@ jobs:
             chmod 644 gradle/wrapper/gradle-wrapper.jar
           fi
 
-      # 9) Build Debug APK (use wrapper if present, else system Gradle)
       - name: Build Debug APK
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
@@ -138,12 +141,10 @@ jobs:
             gradle assembleDebug --stacktrace --no-daemon
           fi
 
-      # 10) Upload all APKs produced
       - name: Upload Debug APK(s)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-apks
-          path: |
-            ${{ steps.gradleroot.outputs.root }}/**/*.apk
+          path: ${{ steps.gradleroot.outputs.root }}/**/*.apk
           if-no-files-found: warn
