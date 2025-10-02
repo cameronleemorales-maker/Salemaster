@@ -38,19 +38,30 @@ jobs:
           mkdir -p "$UNZIP_DIR"
           unzip -q "${{ steps.findzip.outputs.zip }}" -d "$UNZIP_DIR"
 
-      - name: Detect Gradle project root
+   - name: Detect Gradle project root
         id: gradleroot
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          shopt -s globstar nullglob
           ROOT=""
-          while IFS= read -r -d '' f; do ROOT="$(dirname "$f")"; break; done \
-            < <(find "$UNZIP_DIR" -type f -name settings.gradle -o -name settings.gradle.kts -print0 | sort -z)
+          for f in \
+            "$UNZIP_DIR"/**/settings.gradle \
+            "$UNZIP_DIR"/**/settings.gradle.kts \
+            "$UNZIP_DIR"/**/build.gradle \
+            "$UNZIP_DIR"/**/build.gradle.kts
+          do
+            if [[ -f "$f" ]]; then
+              ROOT="$(dirname "$f")"
+              break
+            fi
+          done
           if [[ -z "$ROOT" ]]; then
-            while IFS= read -r -d '' f; do ROOT="$(dirname "$f")"; break; done \
-              < <(find "$UNZIP_DIR" -type f -name build.gradle -o -name build.gradle.kts -print0 | sort -z)
+            echo "Could not find Gradle project"
+            echo "Files under $UNZIP_DIR:"
+            ls -la "$UNZIP_DIR" || true
+            exit 1
           fi
-          [[ -z "$ROOT" ]] && { echo "Could not find Gradle project"; exit 1; }
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
           echo "Gradle root: $ROOT"
 
