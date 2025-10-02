@@ -6,9 +6,8 @@ on:
   workflow_dispatch:
 
 env:
-  ZIP_NAME: SalesMasterApp.zip   # change if your zip has a different name
-  UNZIP_DIR: project             # where we unzip
-  # Pin a Gradle version compatible with AGP 8.x to avoid Gradle 9.x errors
+  ZIP_NAME: SalesMasterApp.zip
+  UNZIP_DIR: project
   SYSTEM_GRADLE_VERSION: 8.5
 
 jobs:
@@ -19,7 +18,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- Locate the ZIP (or fall back to first *.zip) ---
       - name: Verify ZIP exists
         id: findzip
         shell: bash
@@ -28,67 +26,51 @@ jobs:
           if [[ -f "$ZIP_NAME" ]]; then
             echo "zip=$ZIP_NAME" >> "$GITHUB_OUTPUT"
           else
-            echo "ZIP '$ZIP_NAME' not found; searching for any .zip in repo root..."
             z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
             if [[ -z "$z" ]]; then
               echo "No .zip found in repo root"; exit 1
             fi
             echo "zip=$z" >> "$GITHUB_OUTPUT"
           fi
-          echo "Using ZIP: $(cat $GITHUB_OUTPUT | sed -n 's/^zip=//p')"
+          echo "Using ZIP: $(sed -n 's/^zip=//p' "$GITHUB_OUTPUT")"
 
-      # --- Unzip into ./project ---
       - name: Unzip project
         run: |
           rm -rf "$UNZIP_DIR" && mkdir -p "$UNZIP_DIR"
           unzip -q "${{ steps.findzip.outputs.zip }}" -d "$UNZIP_DIR"
-          echo "Unzipped (top levels):"
-          find "$UNZIP_DIR" -maxdepth 2 -type f | sed 's/^/  /' | head -200
+          find "$UNZIP_DIR" -maxdepth 2 -type f | head -200
 
-      # --- Detect Gradle project root (handles nested folders) ---
       - name: Detect Gradle project root
         id: gradleroot
         shell: bash
         run: |
           set -e
           ROOT=""
-          # Prefer settings.gradle(.kts)
-          while IFS= read -r -d '' f; do
-            ROOT="$(dirname "$f")"; break
-          done < <(find "$UNZIP_DIR" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -print0 | sort -z)
-          # Fallback to build.gradle(.kts)
+          while IFS= read -r -d '' f; do ROOT="$(dirname "$f")"; break; done \
+            < <(find "$UNZIP_DIR" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -print0 | sort -z)
           if [[ -z "$ROOT" ]]; then
-            while IFS= read -r -d '' f; do
-              ROOT="$(dirname "$f")"; break
-            done < <(find "$UNZIP_DIR" -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) -print0 | sort -z)
+            while IFS= read -r -d '' f; do ROOT="$(dirname "$f")"; break; done \
+              < <(find "$UNZIP_DIR" -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) -print0 | sort -z)
           fi
-          if [[ -z "$ROOT" ]]; then
-            echo "Could not find a Gradle project (no settings/build.gradle*)."; exit 1
-          fi
+          [[ -z "$ROOT" ]] && { echo "Could not find Gradle project"; exit 1; }
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
           echo "Detected Gradle root: $ROOT"
-          ls -la "$ROOT"
 
-      # --- JDK 17 ---
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # --- Android SDK base (adds cmdline-tools on PATH) ---
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # --- Ensure cmdline-tools + accept licenses without breaking pipe ---
       - name: Install Android platforms & build-tools
         shell: bash
         run: |
           set -e
-          # Find sdkmanager; if missing, install cmdline-tools manually
           SDKMANAGER="$(command -v sdkmanager || true)"
           if [[ -z "$SDKMANAGER" ]]; then
-            echo "sdkmanager not in PATH — installing cmdline-tools..."
             ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}"
             mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
             cd "$ANDROID_SDK_ROOT/cmdline-tools"
@@ -99,45 +81,91 @@ jobs:
             rm -rf temp clt.zip
             SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           fi
-
-          echo "Accepting licenses (ignore broken-pipe exit if it occurs)..."
           yes | "$SDKMANAGER" --licenses || true
-
-          echo "Installing required packages..."
           "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      # --- Gradle setup (pin version; enable cache) ---
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: ${{ env.SYSTEM_GRADLE_VERSION }}
           cache-read-only: false
 
-      # --- Fix wrapper perms if present (avoids exit 126) ---
       - name: Fix Gradle wrapper permissions (if present)
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
-          if [[ -f "./gradlew" ]]; then
-            chmod +x ./gradlew
-          fi
-          if [[ -d "./gradle/wrapper" ]]; then
-            chmod -R u+rwX,go+rX ./gradle/wrapper || true
+          [[ -f ./gradlew ]] && chmod +x ./gradlew
+          [[ -d ./gradle/wrapper ]] && chmod -R u+rwX,go+rX ./gradle/wrapper || true
+
+      # NEW: patch settings + repos to avoid "prefer settings repositories" failure
+      - name: Patch repository policy & repos
+        working-directory: ${{ steps.gradleroot.outputs.root }}
+        shell: bash
+        run: |
+          set -e
+          SFILE=""
+          [[ -f settings.gradle.kts ]] && SFILE="settings.gradle.kts"
+          [[ -z "$SFILE" && -f settings.gradle ]] && SFILE="settings.gradle"
+
+          if [[ -n "$SFILE" ]]; then
+            echo "Patching $SFILE"
+            # If FAIL_ON_PROJECT_REPOS is set, relax it
+            sed -i 's/RepositoriesMode\.FAIL_ON_PROJECT_REPOS/RepositoriesMode.PREFER_SETTINGS/g' "$SFILE" || true
+
+            # Ensure pluginManagement & dependencyResolutionManagement have google() and mavenCentral()
+            if ! grep -q 'pluginManagement' "$SFILE"; then
+              cat >> "$SFILE" <<'EOF'
+
+pluginManagement {
+  repositories {
+    google()
+    mavenCentral()
+    gradlePluginPortal()
+  }
+}
+EOF
+            fi
+
+            if ! grep -q 'dependencyResolutionManagement' "$SFILE"; then
+              cat >> "$SFILE" <<'EOF'
+
+dependencyResolutionManagement {
+  repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+  repositories {
+    google()
+    mavenCentral()
+  }
+}
+EOF
+            fi
           fi
 
-      # --- Build: prefer wrapper; otherwise system Gradle (8.5) ---
+          # Also ensure module/build files have google + mavenCentral if missing
+          for f in $(find . -name "build.gradle" -o -name "build.gradle.kts"); do
+            if ! grep -q "mavenCentral()" "$f"; then
+              echo "Ensuring repos in $f"
+              printf '\nrepositories {\n    google()\n    mavenCentral()\n}\n' >> "$f"
+            fi
+          done
+
+          # Provide sane defaults if missing
+          if [[ ! -f gradle.properties ]]; then
+            cat > gradle.properties <<'EOF'
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.enableJetifier=true
+EOF
+          fi
+
       - name: Build Debug APK
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
           set -e
-          if [[ -x "./gradlew" ]]; then
-            echo "Using Gradle Wrapper"
+          if [[ -x ./gradlew ]]; then
             ./gradlew --no-daemon --stacktrace assembleDebug
           else
             echo "No wrapper found — using system Gradle $SYSTEM_GRADLE_VERSION"
-            gradle --version
-            # If a root build fails, try :app specifically
             if gradle -q :app:tasks --all >/dev/null 2>&1; then
               gradle --no-daemon --stacktrace :app:assembleDebug
             else
@@ -145,7 +173,6 @@ jobs:
             fi
           fi
 
-      # --- Upload APKs (v4) ---
       - name: Upload Debug APK(s)
         uses: actions/upload-artifact@v4
         with:
