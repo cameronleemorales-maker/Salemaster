@@ -25,10 +25,7 @@ jobs:
         shell: bash
         run: |
           ls -la
-          if [[ ! -f "$ZIP_NAME" ]]; then
-            echo "ZIP '$ZIP_NAME' not found in repo root."
-            exit 1
-          fi
+          [[ -f "$ZIP_NAME" ]] || { echo "ZIP '$ZIP_NAME' not found in repo root."; exit 1; }
 
       - name: Unzip project
         shell: bash
@@ -36,8 +33,7 @@ jobs:
           rm -rf "$UNZIP_DIR"
           mkdir -p "$UNZIP_DIR"
           unzip -q "$ZIP_NAME" -d "$UNZIP_DIR"
-          echo "Contents of $UNZIP_DIR:"
-          ls -la "$UNZIP_DIR"
+          echo "Contents of $UNZIP_DIR:"; ls -la "$UNZIP_DIR"
 
       - name: Detect Gradle project root
         id: gradleroot
@@ -47,22 +43,14 @@ jobs:
           shopt -s globstar nullglob
           ROOT=""
           for f in \
-            "$UNZIP_DIR"/**/settings.gradle \
-            "$UNZIP_DIR"/**/settings.gradle.kts \
-            "$UNZIP_DIR"/**/build.gradle \
-            "$UNZIP_DIR"/**/build.gradle.kts
+            "$UNZIP_DIR"/**/settings.gradle "$UNZIP_DIR"/**/settings.gradle.kts \
+            "$UNZIP_DIR"/**/build.gradle   "$UNZIP_DIR"/**/build.gradle.kts
           do
-            if [[ -f "$f" ]]; then
-              ROOT="$(dirname "$f")"
-              break
-            fi
+            if [[ -f "$f" ]]; then ROOT="$(dirname "$f")"; break; fi
           done
-          if [[ -z "$ROOT" ]]; then
-            echo "Could not find a Gradle project (no settings.gradle or build.gradle found)."
-            exit 1
-          fi
+          [[ -n "$ROOT" ]] || { echo "No Gradle project found."; exit 1; }
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Gradle root is: $ROOT"
+          echo "Gradle root: $ROOT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -71,46 +59,64 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      # ---------- FIXED STEP: sdkmanager was not on PATH in same step ----------
-      - name: Install Android SDK (cmdline-tools)
+      # ----- Robust Android SDK install (handles 'Broken pipe' & retries) -----
+      - name: Install Android SDK (cmdline-tools & packages)
         shell: bash
         run: |
           set -euo pipefail
+
           SDK="$ANDROID_SDK_ROOT"
-          mkdir -p "$SDK"/cmdline-tools
+          mkdir -p "$SDK/cmdline-tools"
           cd "$SDK"
 
-          # Download and unpack latest commandline-tools
+          echo "Downloading Android commandline-tools…"
           curl -L -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdline-tools.zip -d cmdline-tools
           mv cmdline-tools/cmdline-tools cmdline-tools/latest
           rm -f cmdline-tools.zip
 
-          # Make sdkmanager available **in this step**
+          # Make tools available *now* in this step
           export ANDROID_SDK_ROOT="$SDK"
           export ANDROID_HOME="$SDK"
-          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/34.0.0:$PATH"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
 
-          echo "sdkmanager path = $(command -v sdkmanager || echo 'NOT FOUND')"
-          if ! command -v sdkmanager >/dev/null 2>&1; then
-            echo "sdkmanager not found after install."
-            ls -la "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" || true
-            exit 127
-          fi
+          echo "sdkmanager path: $(command -v sdkmanager || echo 'NOT FOUND')"
+          command -v sdkmanager >/dev/null || { echo "sdkmanager not found after install"; exit 127; }
 
-          # Accept licenses (ignore broken pipe noise)
-          yes | sdkmanager --licenses || true
+          echo "Accepting licenses (ignore Broken pipe)…"
+          set +e
+          yes | sdkmanager --licenses
+          # capture and ignore nonzero from 'yes' broken pipe
+          LIC_EXIT=$?
+          set -e
+          echo "License exit code: $LIC_EXIT (ignored)"
 
-          # Required packages
-          yes | sdkmanager "platform-tools" "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}"
+          retry() {
+            local n=0 max=3 delay=5
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                echo "Command failed after $n attempts: $*"
+                return 1
+              fi
+              echo "Retry $n/$max in ${delay}s: $*"
+              sleep $delay
+            done
+          }
 
-          # Also export to later steps
+          echo "Installing platform-tools, platform, and build-tools…"
+          retry bash -c 'yes | sdkmanager --install "platform-tools" "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}" --sdk_root="$ANDROID_SDK_ROOT"'
+
+          echo "Verifying build-tools installed…"
+          [[ -d "$ANDROID_SDK_ROOT/${ANDROID_BUILD_TOOLS//;/\/}" ]] || { echo "Build-tools not found."; ls -R "$ANDROID_SDK_ROOT" || true; exit 1; }
+
+          # Persist for later steps
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_SDK_ROOT/build-tools/34.0.0" >> "$GITHUB_PATH"
-      # ------------------------------------------------------------------------
+          echo "$ANDROID_SDK_ROOT/${ANDROID_BUILD_TOOLS//;/\/}" >> "$GITHUB_PATH"
+      # -----------------------------------------------------------------------
 
       - name: Set up Gradle (cache & tools)
         uses: gradle/actions/setup-gradle@v3
@@ -118,33 +124,9 @@ jobs:
       - name: Fix Gradle wrapper permissions (if present)
         shell: bash
         run: |
-          set -euo pipefail
           cd "${{ steps.gradleroot.outputs.root }}"
-          if [[ -f "./gradlew" ]]; then
-            chmod +x ./gradlew
-          fi
-          if [[ -f "gradle/wrapper/gradle-wrapper.jar" ]]; then
-            chmod 644 gradle/wrapper/gradle-wrapper.jar
-          fi
+          [[ -f ./gradlew ]] && chmod +x ./gradlew
+          [[ -f gradle/wrapper/gradle-wrapper.jar ]] && chmod 644 gradle/wrapper/gradle-wrapper.jar
 
       - name: Build Debug APK
-        working-directory: ${{ steps.gradleroot.outputs.root }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -x "./gradlew" ]]; then
-            ./gradlew --version
-            ./gradlew assembleDebug --stacktrace --no-daemon
-          else
-            echo "No gradlew found; using system Gradle"
-            gradle --version
-            gradle assembleDebug --stacktrace --no-daemon
-          fi
-
-      - name: Upload Debug APK(s)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-apks
-          path: ${{ steps.gradleroot.outputs.root }}/**/*.apk
-          if-no-files-found: warn
+        working-directory
