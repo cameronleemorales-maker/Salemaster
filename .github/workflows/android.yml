@@ -33,8 +33,7 @@ jobs:
           rm -rf "$UNZIP_DIR"
           mkdir -p "$UNZIP_DIR"
           unzip -q "$ZIP_NAME" -d "$UNZIP_DIR"
-          echo "Unzipped content:"
-          ls -la "$UNZIP_DIR"
+          echo "Unzipped content:"; ls -la "$UNZIP_DIR"
 
       - name: Detect Gradle project root
         id: gradleroot
@@ -51,9 +50,7 @@ jobs:
           done
           [[ -n "$ROOT" ]] || { echo "Could not find a Gradle project in $UNZIP_DIR"; exit 1; }
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Detected Gradle root: $ROOT"
-          echo "Listing root:"
-          ls -la "$ROOT"
+          echo "Detected Gradle root: $ROOT"; ls -la "$ROOT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -62,7 +59,6 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      # Robust Android SDK install (handles 'Broken pipe' + retries)
       - name: Install Android SDK (cmdline-tools & packages)
         shell: bash
         run: |
@@ -74,19 +70,12 @@ jobs:
           unzip -q cmdline-tools.zip -d cmdline-tools
           mv cmdline-tools/cmdline-tools cmdline-tools/latest
           rm -f cmdline-tools.zip
-          export ANDROID_SDK_ROOT="$SDK"
-          export ANDROID_HOME="$SDK"
+          export ANDROID_SDK_ROOT="$SDK"; export ANDROID_HOME="$SDK"
           export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
           command -v sdkmanager >/dev/null || { echo "sdkmanager not found"; exit 127; }
-          set +e
-          yes | sdkmanager --licenses
-          echo "License acceptance exit (ignored): $?"
-          set -e
-          retry() { n=0; max=3; delay=5; until "$@"; do n=$((n+1)); (( n>=max )) && { echo "failed: $*"; return 1; }; echo "retry $n/$max..."; sleep $delay; done; }
+          set +e; yes | sdkmanager --licenses; echo "licenses exit: $?"; set -e
+          retry() { n=0; max=3; until "$@"; do n=$((n+1)); (( n>=max )) && return 1; echo "retry $n/$max"; sleep 5; done; }
           retry bash -c 'yes | sdkmanager --install "platform-tools" "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}" --sdk_root="$ANDROID_SDK_ROOT"'
-          [[ -d "$ANDROID_SDK_ROOT/${ANDROID_BUILD_TOOLS//;/\/}" ]] || { echo "build-tools missing"; exit 1; }
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/${ANDROID_BUILD_TOOLS//;/\/}" >> "$GITHUB_PATH"
@@ -94,8 +83,63 @@ jobs:
       - name: Set up Gradle (cache & tools)
         uses: gradle/actions/setup-gradle@v3
 
+      # >>> NEW: patch repository policy to avoid FAIL_ON_PROJECT_REPOS errors
+      - name: Patch repo policy and repositories
+        working-directory: ${{ steps.gradleroot.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ensure settings.gradle(.kts) exists
+          SETTINGS=""
+          if [[ -f settings.gradle.kts ]]; then SETTINGS="settings.gradle.kts"; elif [[ -f settings.gradle ]]; then SETTINGS="settings.gradle"; else echo "No settings.gradle found"; exit 1; fi
+          echo "Using $SETTINGS"
+
+          # Add/replace dependencyResolutionManagement with repos in settings
+          if [[ "$SETTINGS" == "settings.gradle.kts" ]]; then
+            awk '
+              BEGIN{seen=0}
+              /dependencyResolutionManagement\s*\{/ {seen=1}
+              {print}
+              END{
+                if(seen==0){
+                  print "dependencyResolutionManagement {"
+                  print "    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)"
+                  print "    repositories {"
+                  print "        google()"
+                  print "        mavenCentral()"
+                  print "    }"
+                  print "}"
+                }
+              }' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+          else
+            awk '
+              BEGIN{seen=0}
+              /dependencyResolutionManagement\s*\{/ {seen=1}
+              {print}
+              END{
+                if(seen==0){
+                  print "dependencyResolutionManagement {"
+                  print "    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)"
+                  print "    repositories {"
+                  print "        google()"
+                  print "        mavenCentral()"
+                  print "    }"
+                  print "}"
+                }
+              }' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+          fi
+
+          # Remove module-level repositories blocks that only declare google/mavenCentral
+          shopt -s globstar nullglob
+          for f in **/build.gradle **/build.gradle.kts; do
+            [[ -f "$f" ]] || continue
+            # Strip simple repositories blocks to honor settings-level repos
+            perl -0777 -pe '
+              s/repositories\s*\{\s*(google\(\)\s*;?\s*)?(mavenCentral\(\)\s*;?\s*)?(jcenter\(\)\s*;?\s*)?\s*\}\s*//gms
+            ' -i "$f" || true
+          done
+
       - name: Fix Gradle wrapper permissions (if present)
-        if: ${{ steps.gradleroot.outputs.root != '' }}
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
@@ -109,11 +153,11 @@ jobs:
           set -euo pipefail
           if [[ -x ./gradlew ]]; then
             ./gradlew --version
-            ./gradlew assembleDebug --stacktrace --no-daemon
+            ./gradlew assembleDebug --stacktrace --warning-mode all --no-daemon
           else
             echo "No gradlew; using system Gradle"
             gradle --version
-            gradle assembleDebug --stacktrace --no-daemon
+            gradle assembleDebug --stacktrace --warning-mode all --no-daemon
           fi
 
       - name: Upload Debug APK(s)
@@ -122,4 +166,12 @@ jobs:
         with:
           name: debug-apks
           path: ${{ steps.gradleroot.outputs.root }}/**/*.apk
+          if-no-files-found: warn
+
+      - name: Upload Gradle problem reports (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-problems
+          path: ${{ steps.gradleroot.outputs.root }}/**/build/reports/problems/**
           if-no-files-found: warn
