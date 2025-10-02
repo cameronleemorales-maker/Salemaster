@@ -129,4 +129,23 @@ jobs:
           [[ -f gradle/wrapper/gradle-wrapper.jar ]] && chmod 644 gradle/wrapper/gradle-wrapper.jar
 
       - name: Build Debug APK
-        working-directory
+        working-directory: ${{ steps.gradleroot.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x ./gradlew ]]; then
+            ./gradlew --version
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            echo "No gradlew; using system Gradle"
+            gradle --version
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Upload Debug APK(s)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: ${{ steps.gradleroot.outputs.root }}/**/*.apk
+          if-no-files-found: warn
