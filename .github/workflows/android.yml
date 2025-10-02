@@ -16,6 +16,7 @@ jobs:
       ANDROID_HOME: ${{ github.workspace }}/android-sdk
       ANDROID_PLATFORM: "platforms;android-34"
       ANDROID_BUILD_TOOLS: "build-tools;34.0.0"
+      FALLBACK_GRADLE_VERSION: "8.2.1"
 
     steps:
       - name: Checkout
@@ -57,7 +58,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Install Android SDK (cmdline-tools & packages)
         shell: bash
@@ -80,21 +80,22 @@ jobs:
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
           echo "$ANDROID_SDK_ROOT/${ANDROID_BUILD_TOOLS//;/\/}" >> "$GITHUB_PATH"
 
-      - name: Set up Gradle (cache & tools)
+      - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: false
 
-      # >>> NEW: patch repository policy to avoid FAIL_ON_PROJECT_REPOS errors
+      # Keep repos at settings-level to avoid FAIL_ON_PROJECT_REPOS-style errors
       - name: Patch repo policy and repositories
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
-          # Ensure settings.gradle(.kts) exists
           SETTINGS=""
-          if [[ -f settings.gradle.kts ]]; then SETTINGS="settings.gradle.kts"; elif [[ -f settings.gradle ]]; then SETTINGS="settings.gradle"; else echo "No settings.gradle found"; exit 1; fi
+          if [[ -f settings.gradle.kts ]]; then SETTINGS="settings.gradle.kts"; elif [[ -f settings.gradle ]]; then SETTINGS="settings.gradle"; fi
+          if [[ -z "$SETTINGS" ]]; then echo "No settings.gradle(.kts) found"; exit 1; fi
           echo "Using $SETTINGS"
 
-          # Add/replace dependencyResolutionManagement with repos in settings
           if [[ "$SETTINGS" == "settings.gradle.kts" ]]; then
             awk '
               BEGIN{seen=0}
@@ -129,36 +130,46 @@ jobs:
               }' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
           fi
 
-          # Remove module-level repositories blocks that only declare google/mavenCentral
           shopt -s globstar nullglob
           for f in **/build.gradle **/build.gradle.kts; do
             [[ -f "$f" ]] || continue
-            # Strip simple repositories blocks to honor settings-level repos
-            perl -0777 -pe '
-              s/repositories\s*\{\s*(google\(\)\s*;?\s*)?(mavenCentral\(\)\s*;?\s*)?(jcenter\(\)\s*;?\s*)?\s*\}\s*//gms
-            ' -i "$f" || true
+            perl -0777 -pe 's/repositories\s*\{\s*(google\(\)\s*;?\s*)?(mavenCentral\(\)\s*;?\s*)?(jcenter\(\)\s*;?\s*)?\s*\}\s*//gms' -i "$f" || true
           done
 
-      - name: Fix Gradle wrapper permissions (if present)
+      - name: Ensure Gradle executable
+        id: gradlebin
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
-          if [[ -f ./gradlew ]]; then chmod +x ./gradlew; fi
-          if [[ -f gradle/wrapper/gradle-wrapper.jar ]]; then chmod 644 gradle/wrapper/gradle-wrapper.jar; fi
+          set -euo pipefail
+          if [[ -f ./gradlew ]]; then
+            chmod +x ./gradlew
+            echo "bin=./gradlew" >> "$GITHUB_OUTPUT"
+          else
+            echo "No gradlew in ZIP -> installing Gradle ${FALLBACK_GRADLE_VERSION}"
+            cd "${{ github.workspace }}"
+            curl -L -o gradle.zip "https://services.gradle.org/distributions/gradle-${FALLBACK_GRADLE_VERSION}-bin.zip"
+            unzip -q gradle.zip
+            echo "bin=${{ github.workspace }}/gradle-${FALLBACK_GRADLE_VERSION}/bin/gradle" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build Debug APK
         working-directory: ${{ steps.gradleroot.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -x ./gradlew ]]; then
-            ./gradlew --version
-            ./gradlew assembleDebug --stacktrace --warning-mode all --no-daemon
-          else
-            echo "No gradlew; using system Gradle"
-            gradle --version
-            gradle assembleDebug --stacktrace --warning-mode all --no-daemon
-          fi
+          "$GRADLE_BIN" --version >/dev/null 2>&1 || true
+        env:
+          GRADLE_BIN: ${{ steps.gradlebin.outputs.bin }}
+
+      - name: Assemble (with stacktrace & info)
+        working-directory: ${{ steps.gradleroot.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GRADLE_BIN" clean assembleDebug --stacktrace --info --warning-mode all --no-daemon
+        env:
+          GRADLE_BIN: ${{ steps.gradlebin.outputs.bin }}
 
       - name: Upload Debug APK(s)
         if: always()
@@ -168,7 +179,7 @@ jobs:
           path: ${{ steps.gradleroot.outputs.root }}/**/*.apk
           if-no-files-found: warn
 
-      - name: Upload Gradle problem reports (if any)
+      - name: Upload Gradle Problems Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
